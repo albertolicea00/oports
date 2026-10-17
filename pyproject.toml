@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oports"
+version = "1.0.0"
+authors = [
+  { name="Alberto Licea", email="83251892+albertolicea00@users.noreply.github.com" },
+]
+description = "Fast local network scanner and device discovery CLI tool"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.scripts]
+oports = "cli.oports:main"

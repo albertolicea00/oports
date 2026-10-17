@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""
+OPorts CLI - Network discovery and port inspection tool.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+# Ensure cli directory is in sys.path
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from scanner import scan_network
+from formatter import print_banner, format_device_table
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="oports",
+        description="OPorts CLI - Fast local network scanner and device discovery tool.",
+        epilog="Example: oports --ips"
+    )
+    
+    parser.add_argument(
+        "--ips",
+        action="store_true",
+        help="Scan and display all active IPs, MAC addresses, vendors, and devices on the local network."
+    )
+    parser.add_argument(
+        "subcommand",
+        nargs="?",
+        default=None,
+        help="Optional positional subcommand (e.g., 'ips')"
+    )
+    parser.add_argument(
+        "-i", "--interface",
+        type=str,
+        default=None,
+        help="Specify network interface to scan (e.g., en0, en6)"
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output results as structured JSON."
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color output in terminal."
+    )
+
+    args = parser.parse_args()
+
+    # Support both --ips flag and 'oports ips' positional command
+    if not args.ips and args.subcommand != "ips":
+        print_banner(use_color=not args.no_color)
+        print("\nQuick Usage:")
+        print("  oports --ips            Scan and display the network devices table")
+        print("  oports --ips --json     Output results formatted as JSON")
+        print("  oports --ips -i en0     Scan through a specific network interface\n")
+        print("Use 'oports --help' to see all available options.")
+        sys.exit(0)
+
+    use_color = (not args.no_color) and sys.stdout.isatty()
+
+    if not args.json:
+        print_banner(use_color=use_color)
+        print("\n🔍 Scanning local network for active devices... (please wait a few seconds)\n")
+
+    devices, subnet_info = scan_network(target_interface=args.interface)
+
+    if args.json:
+        output_data = {
+            "subnet": subnet_info,
+            "total_devices": len(devices),
+            "devices": devices
+        }
+        print(json.dumps(output_data, indent=2, ensure_ascii=False))
+    else:
+        table = format_device_table(devices, subnet_info=subnet_info, use_color=use_color)
+        print(table)
+        print(f"\n✅ Total active devices found: {len(devices)}\n")
+
+if __name__ == "__main__":
+    main()
