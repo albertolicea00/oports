@@ -8,7 +8,7 @@ version = "1.0.0"
 authors = [
   { name="Alberto Licea", email="83251892+albertolicea00@users.noreply.github.com" },
 ]
-description = "Fast local network scanner and device discovery CLI tool"
+description = "LAN scanner with CLI, terminal, tray, and desktop interfaces"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -16,16 +16,24 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS :: MacOS X",
-    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: System :: Networking",
     "Topic :: System :: Systems Administration",
 ]
 
 [project.scripts]
-oports = "cli.main:main"
+oports = "interfaces.cli:main"
+
+[project.gui-scripts]
+oports-desktop = "interfaces.tray.app:main"
+oports-tray = "interfaces.tray.app:tray_main"
 
 [project.optional-dependencies]
 tui = ["textual>=0.58"]
+desktop = ["PySide6>=6.5"]
 
 [tool.setuptools.package-data]
-"cli.tui" = ["*.tcss"]
+"interfaces.tui" = ["*.tcss"]
+
+[tool.setuptools.packages.find]
+include = ["core*", "platforms*", "interfaces*"]
