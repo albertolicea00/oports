@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Platform: macOS / POSIX](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
+[![Platform: macOS / Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)]()
 
-> A Python CLI and interactive dashboard for discovering LAN devices, inspecting services, and viewing local TCP listeners.
+> A network inspector with CLI, terminal dashboard, system tray, and desktop interfaces.
 
 ---
 
@@ -47,8 +47,9 @@ Subnet analyzed: 192.168.1.0/24 (en0) | Devices discovered: 7
 - 📡 **Local Hostname Resolution**: Resolves names via Bonjour/mDNS, NetBIOS, and LLMNR reverse PTR where supported; UPnP descriptions may add a friendly name and model.
 - 🔍 **Signature Port Profiling**: Performs non-blocking probes on signature ports (RDP `3389`, Web `80`/`443`, SSH `22`, SMB `445`) to classify device roles (e.g., Windows PC with RDP, Web Router).
 - 💻 **Self & Gateway Awareness**: Identifies and tags your own machine, active network interfaces (`en0`, `en6`), and the default router/gateway.
-- 📦 **Standard-library CLI**: The table and inspector use Python and native OS tools (`ping`, `arp`, `dns-sd`, `scutil`, `lsof`). The interactive dashboard uses the optional Textual package.
+- 📦 **Shared scanning engine**: The CLI uses Python and native OS tools. The terminal dashboard uses optional Textual; the tray and desktop window use optional PySide6.
 - 🖥️ **Interactive dashboard**: Navigate LAN devices, local listeners, active TCP connections, and gateway/interface information; filter devices, view live RTT trends, inspect a selected host with scan progress, and read UPnP port mappings when the router permits it.
+- 🪟 **Desktop and tray**: A device list, local port list, and background refresh from the macOS menu bar or Windows notification area.
 
 ---
 
@@ -78,6 +79,14 @@ For the interactive dashboard, install the optional dependency:
 pip install -e '.[tui]'
 ```
 
+For the desktop window and system tray, install PySide6:
+
+```bash
+pip install -e '.[desktop]'
+```
+
+On Windows, use PowerShell to install the same package; the CLI reads interfaces, neighbours, DHCP leases, and TCP listeners with Windows system commands. Bonjour discovery currently runs only on macOS.
+
 ---
 
 ## 🎯 Usage
@@ -87,6 +96,19 @@ Open the dashboard in a terminal:
 ```bash
 oports
 ```
+
+Open the desktop list or the tray app:
+
+```bash
+oports --desktop
+oports --tray
+```
+
+The installed commands `oports-desktop` and `oports-tray` do the same. Closing the window hides it when the tray is available; use **Quit** in the tray menu to exit.
+
+To make standalone apps, run `pyside6-deploy gui.py` for the desktop-first app or `pyside6-deploy tray_gui.py` for the tray-first app. Run the build on macOS for an `.app` bundle and on Windows for an `.exe`; the repository does not contain prebuilt installers.
+
+Run the automated checks with `python -m unittest discover -s tests -t .`.
 
 Scan your local network and print the table:
 
@@ -103,6 +125,8 @@ oports --ips
 | `--ips` | `ips` | Scan the local network and print the device discovery table. |
 | `--local` | `local` | Print local listening TCP ports. |
 | `--tui` | | Open the interactive dashboard. |
+| `--desktop` | | Open the device and local port lists in a window. |
+| `--tray` | | Run from the macOS menu bar or Windows notification area. |
 | `--inspect <IP>` | | Inspect one IPv4 host, including common ports and service banners. |
 | `--verbose` | | Print a detailed inspection for each discovered host with `--ips`. |
 | `--json` | | Output discovered devices and network metadata in structured JSON. |
@@ -158,15 +182,18 @@ While both tools can discover active hosts and check open ports, they serve dist
 ```text
 OPorts/
 ├── cli/
-│   ├── __init__.py      # Package initialization
-│   ├── oports           # Executable CLI entrypoint
-│   ├── main.py          # Installed CLI entrypoint and argument parsing
-│   ├── scanner.py       # Discovery engine (ping sweep, ARP, mDNS, ports)
-│   ├── discovery.py     # NetBIOS, SSDP, service and latency probes
-│   ├── local_ports.py   # Local TCP listeners
-│   ├── tui/             # Textual dashboard
-│   ├── vendors.py       # MAC OUI database & private address detection
-│   └── formatter.py     # ANSI styling and Unicode box-drawing table renderer
+│   └── oports           # Source checkout launcher
+├── core/                # Shared scanner, discovery, models, and formatting
+├── platforms/           # macOS and Windows system adapters
+├── interfaces/
+│   ├── cli.py           # Command line arguments and output
+│   ├── tui/             # Textual terminal dashboard
+│   ├── desktop/         # Device and port list window
+│   └── tray/            # macOS menu bar and Windows tray
+├── tests/               # Core, platform, and interface tests
+├── __main__.py          # Source directory entry point
+├── gui.py               # Standalone desktop build entry point
+├── tray_gui.py          # Standalone tray build entry point
 ├── .gitignore           # Standard Python & macOS ignore rules
 ├── CONTRIBUTING.md      # Guidelines for contributors
 ├── LICENSE              # MIT License
