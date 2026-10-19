@@ -1,6 +1,7 @@
 """
 Network scanner engine for OPorts CLI.
-Performs fast subnet discovery, ARP inspection, mDNS resolution, and port profiling.
+Performs fast subnet discovery, ARP inspection, mDNS resolution, port profiling,
+latency (RTT) and OS fingerprinting via TTL.
 """
 
 import concurrent.futures
@@ -11,7 +12,26 @@ import subprocess
 import time
 from typing import Dict, List, Optional, Tuple
 
-from vendors import lookup_vendor, is_private_mac
+try:
+    from .vendors import lookup_vendor, is_private_mac
+    from . import discovery
+    from .dhcp import get_lease_servers, multiple_servers_on_same_subnet
+except ImportError:  # Direct execution from cli/oports
+    from vendors import lookup_vendor, is_private_mac
+    import discovery
+    from dhcp import get_lease_servers, multiple_servers_on_same_subnet
+
+discover_mdns_deep = discovery.discover_mdns_deep
+check_ios_lockdown = discovery.check_ios_lockdown
+query_netbios = discovery.query_netbios
+query_llmnr_ptr = discovery.query_llmnr_ptr
+query_ssdp = discovery.query_ssdp
+get_ssdp_description = discovery.get_ssdp_description
+probe_ports_fast = discovery.probe_ports_fast
+measure_latency_and_ttl = discovery.measure_latency_and_ttl
+get_http_banner = discovery.get_http_banner
+get_ssh_banner = discovery.get_ssh_banner
+PORT_SERVICE_MAP = discovery.PORT_SERVICE_MAP
 
 def get_computer_name() -> str:
     """Gets the friendly name of the local computer (macOS)."""
@@ -32,7 +52,6 @@ def get_default_gateway() -> Optional[str]:
             parts = line.split()
             if len(parts) >= 2 and parts[0] == "default":
                 gw = parts[1]
-                # Filter out IPv6 and link#
                 if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", gw):
                     return gw
     except Exception:
@@ -57,7 +76,6 @@ def get_active_interfaces() -> List[Dict[str, str]]:
                 iface_blocks[current_iface].append(line.strip())
 
         for iface_name, lines in iface_blocks.items():
-            # Skip loopback and tunnel interfaces
             if iface_name.startswith("lo") or iface_name.startswith("utun") or iface_name.startswith("bridge"):
                 continue
 
@@ -91,56 +109,62 @@ def get_active_interfaces() -> List[Dict[str, str]]:
         pass
     return interfaces
 
-def discover_mdns_names() -> Dict[str, str]:
+def get_arp_table(network: ipaddress.IPv4Network) -> Dict[str, Dict[str, str]]:
     """
-    Discovers human-readable names announced over mDNS (Bonjour)
-    such as iPhones, iPads, MacBooks, Apple TVs, Google Cast, etc.
+    Parses `arp -an` to get IP, MAC, interface, and cache entry state (dynamic vs permanent).
     """
-    mdns_map = {}
+    arp_entries = {}
     try:
-        # Run a short browse for companion-link and smb
-        cmd = "dns-sd -B _companion-link._tcp local & PID1=$!; dns-sd -B _smb._tcp local & PID2=$!; sleep 1; kill $PID1 $PID2 2>/dev/null"
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
-        instances = []
-        for line in res.stdout.splitlines():
-            if " Add " in line and ("_companion-link._tcp." in line or "_smb._tcp." in line):
-                parts = line.split()
-                if len(parts) >= 7:
-                    instance_name = " ".join(parts[6:]).replace("\\032", " ").strip()
-                    if instance_name and instance_name not in instances:
-                        instances.append(instance_name)
+        # Use '-an' to skip reverse DNS lookups; plain 'arp -a' attempts DNS PTR queries
+        # for all subnet IPs, which times out and drops active LAN devices.
+        arp_res = subprocess.run(["arp", "-an"], capture_output=True, text=True, timeout=5)
+        for line in arp_res.stdout.splitlines():
+            if "(" not in line or ")" not in line or " at " not in line:
+                continue
+            ip_match = re.search(r"\(([\d\.]+)\)", line)
+            if not ip_match:
+                continue
+            dev_ip = ip_match.group(1)
 
-        # Resolve discovered instances to IP
-        for inst in instances:
             try:
-                clean_host = inst.replace(" ", "-").replace("’", "").replace("'", "")
-                ip_match = socket.gethostbyname(f"{clean_host}.local")
-                if ip_match:
-                    mdns_map[ip_match] = inst
+                if ipaddress.IPv4Address(dev_ip) not in network:
+                    continue
             except Exception:
-                pass
+                continue
+
+            parts = line.split()
+            try:
+                at_idx = parts.index("at")
+                mac = parts[at_idx + 1].lower()
+                iface = parts[at_idx + 3] if len(parts) > at_idx + 3 else ""
+            except ValueError:
+                continue
+
+            if mac == "(incomplete)" or mac == "ff:ff:ff:ff:ff:ff":
+                continue
+
+            try:
+                mac_clean = ":".join(f"{int(x, 16):02x}" for x in mac.split(":"))
+            except ValueError:
+                continue
+            is_perm = "permanent" in line.lower()
+            expiry = re.search(r"expires? in (\d+) seconds?", line, re.IGNORECASE)
+
+            arp_entries[dev_ip] = {
+                "ip": dev_ip,
+                "mac": mac_clean,
+                "iface": iface,
+                "is_permanent": is_perm,
+                "arp_type": "Static" if is_perm else "Dynamic",
+                "arp_expires_seconds": int(expiry.group(1)) if expiry else None
+            }
     except Exception:
         pass
-    return mdns_map
-
-def probe_ports(ip: str, ports: List[int] = [80, 443, 3389, 22, 445, 53, 8080]) -> List[int]:
-    """Probes a selection of common signature ports on a given IP."""
-    open_ports = []
-    for port in ports:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.15)
-        try:
-            if s.connect_ex((ip, port)) == 0:
-                open_ports.append(port)
-        except Exception:
-            pass
-        finally:
-            s.close()
-    return open_ports
+    return arp_entries
 
 def scan_network(target_interface: Optional[str] = None) -> Tuple[List[Dict], str]:
     """
-    Scans the local network and returns a structured list of devices.
+    Scans the local network and returns an enriched, sorted list of devices.
     """
     interfaces = get_active_interfaces()
     if not interfaces:
@@ -148,7 +172,9 @@ def scan_network(target_interface: Optional[str] = None) -> Tuple[List[Dict], st
 
     # Select interface
     if target_interface:
-        selected_iface = next((i for i in interfaces if i["interface"] == target_interface), interfaces[0])
+        selected_iface = next((i for i in interfaces if i["interface"] == target_interface), None)
+        if selected_iface is None:
+            raise ValueError("interface {} is not active".format(target_interface))
     else:
         selected_iface = interfaces[0]
 
@@ -156,62 +182,31 @@ def scan_network(target_interface: Optional[str] = None) -> Tuple[List[Dict], st
     local_macs = {i["mac"].lower(): i for i in interfaces if i["mac"]}
     gateway_ip = get_default_gateway()
     computer_name = get_computer_name()
+    dhcp_servers = get_lease_servers(interfaces)
+    unusual_dhcp = multiple_servers_on_same_subnet(interfaces, dhcp_servers)
 
     ip_str = selected_iface["ip"]
     netmask_str = selected_iface["netmask"]
     network = ipaddress.IPv4Network(f"{ip_str}/{netmask_str}", strict=False)
     subnet_label = f"{network.network_address}/{network.prefixlen} ({selected_iface['interface']})"
 
-    # 1. Broadcast ping
-    if selected_iface.get("broadcast"):
-        subprocess.run(["ping", "-c", "2", selected_iface["broadcast"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 2. Concurrent ping sweep
+    # Concurrently ping hosts; each process has a firm deadline because some
+    # platforms wait indefinitely on broadcast or ARP resolution.
     all_hosts = [str(h) for h in network.hosts() if str(h) != ip_str][:254]
     def fast_ping(h):
-        subprocess.run(["ping", "-c", "1", "-W", "150", h], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(["ping", "-c", "1", "-W", "150", h],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=60) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as executor:
         list(executor.map(fast_ping, all_hosts))
 
-    # 3. Read ARP table
-    arp_res = subprocess.run(["arp", "-an"], capture_output=True, text=True)
-    arp_devices = {}
+    # 3. Read ARP cache with flags
+    arp_devices = get_arp_table(network)
 
-    for line in arp_res.stdout.splitlines():
-        if "(" not in line or ")" not in line or " at " not in line:
-            continue
-        ip_match = re.search(r"\(([\d\.]+)\)", line)
-        if not ip_match:
-            continue
-        dev_ip = ip_match.group(1)
-        
-        try:
-            if ipaddress.IPv4Address(dev_ip) not in network:
-                continue
-        except Exception:
-            continue
-
-        parts = line.split()
-        try:
-            at_idx = parts.index("at")
-            mac = parts[at_idx + 1].lower()
-            iface = parts[at_idx + 3] if len(parts) > at_idx + 3 else ""
-        except ValueError:
-            continue
-
-        if mac == "(incomplete)" or mac == "ff:ff:ff:ff:ff:ff":
-            continue
-
-        # Standardize MAC format
-        mac_clean = ":".join(f"{int(x, 16):02x}" for x in mac.split(":"))
-        arp_devices[dev_ip] = {
-            "ip": dev_ip,
-            "mac": mac_clean,
-            "iface": iface
-        }
-
-    # Ensure local interfaces are in the list
+    # Ensure local interfaces are included
     for iface_info in interfaces:
         lip = iface_info["ip"]
         lmac = iface_info["mac"].lower()
@@ -220,72 +215,257 @@ def scan_network(target_interface: Optional[str] = None) -> Tuple[List[Dict], st
             arp_devices[lip] = {
                 "ip": lip,
                 "mac": mac_clean,
-                "iface": iface_info["interface"]
+                "iface": iface_info["interface"],
+                "is_permanent": True,
+                "arp_type": "Static",
+                "arp_expires_seconds": None
             }
 
-    # 4. Discover mDNS names
-    mdns_names = discover_mdns_names()
+    # Count occurrences of MACs across the subnet to detect duplicates
+    mac_counts = {}
+    for entry in arp_devices.values():
+        m = entry["mac"]
+        mac_counts[m] = mac_counts.get(m, 0) + 1
 
-    # 5. Enrich device information concurrently
-    devices = []
-    
-    def enrich_device(ip: str):
+    # 4. Concurrently run deep mDNS and SSDP discovery
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as discovery_pool:
+        mdns_future = discovery_pool.submit(discover_mdns_deep)
+        ssdp_future = discovery_pool.submit(query_ssdp, 1.0)
+
+        mdns_ip_map, mdns_mac_map = mdns_future.result()
+        ssdp_devices = ssdp_future.result()
+
+    # 5. Enrich each discovered device
+    def enrich_device(ip: str) -> Dict:
         data = arp_devices[ip]
         mac = data["mac"]
         is_local = ip in local_ips or mac.lower() in local_macs
         is_gw = (ip == gateway_ip)
+        has_dup_mac = (mac_counts.get(mac, 0) > 1)
 
         vendor = lookup_vendor(mac)
-        open_ports = probe_ports(ip)
+        open_ports = probe_ports_fast(ip)
+        has_ios_sync = check_ios_lockdown(ip) if (62078 in open_ports or is_private_mac(mac)) else False
+        rtt, ttl, os_guess = measure_latency_and_ttl(ip, open_ports)
 
+        nb_info = query_netbios(ip, timeout=0.25) if not is_local and not is_gw else None
+        llmnr_name = query_llmnr_ptr(ip) if not is_local and not is_gw and not nb_info and ip not in mdns_ip_map and mac.lower() not in mdns_mac_map else None
+        ssdp_info = get_ssdp_description(ip, ssdp_devices[ip].get("location", "")) if ip in ssdp_devices else {}
+
+        # Name resolution hierarchy:
+        # 1. Local machine
+        # 2. Gateway router
+        # 3. mDNS name by IP or MAC
+        # 4. NetBIOS name (if port 137 or Windows)
+        # 5. iOS Lockdown detection
+        # 6. Port/Service fingerprint
         name = ""
-        notes = ""
+        service_notes = []
+
+        if has_dup_mac and not is_local:
+            service_notes.append("[!] Duplicate MAC")
+        if ip in dhcp_servers.values():
+            service_notes.append("DHCP server (accepted lease)")
+        if ip in unusual_dhcp.get(str(network), []):
+            service_notes.append("[!] Multiple DHCP servers in local leases")
 
         if is_local:
             iface_used = local_ips.get(ip, {}).get("interface", data["iface"])
             name = f"This Mac ({computer_name})"
-            notes = f"Current host ({iface_used})"
+            service_notes.append(f"Current host ({iface_used}, {data['arp_type'].lower()})")
         elif is_gw:
-            name = f"Router / Gateway"
+            name = "Router / Gateway"
             if 80 in open_ports or 443 in open_ports:
-                notes = "Active (Web Admin Panel)"
+                service_notes.append("Web Admin Panel")
             else:
-                notes = "Active (Gateway)"
+                service_notes.append("Gateway")
         else:
-            # Check mDNS name first
-            if ip in mdns_names:
-                name = mdns_names[ip]
-                notes = f"Active ({vendor})"
-            elif 3389 in open_ports:
+            # Check mDNS
+            if ip in mdns_ip_map:
+                name = mdns_ip_map[ip]
+            elif mac.lower() in mdns_mac_map:
+                name = mdns_mac_map[mac.lower()]
+            elif nb_info and nb_info.get("computer_name"):
+                name = nb_info["computer_name"]
+                if nb_info.get("workgroup"):
+                    service_notes.append("Workgroup: {}".format(nb_info["workgroup"]))
+            elif llmnr_name:
+                name = llmnr_name
+            elif ssdp_info.get("friendlyName") or ssdp_info.get("modelName"):
+                name = ssdp_info.get("friendlyName") or ssdp_info["modelName"]
+            elif 3389 in open_ports or 445 in open_ports or 139 in open_ports:
                 name = f"PC {vendor} (Windows)" if vendor != "Unknown" else "Windows PC"
-                notes = "Active (Remote Desktop / RDP)"
+                service_notes.append("Windows sharing / RDP")
+            elif has_ios_sync or 62078 in open_ports:
+                name = "Apple iPhone / iPad"
+                vendor = "Apple (iOS-Sync)"
+                service_notes.append("iOS Lockdown :62078")
             elif 22 in open_ports:
-                name = f"Linux / Unix Server"
-                notes = "Active (SSH :22)"
+                name = f"Linux / Unix Server ({vendor})" if vendor != "Unknown" else "Linux Server"
+                service_notes.append("SSH :22")
             elif 80 in open_ports or 443 in open_ports:
                 name = f"{vendor} Device" if vendor != "Unknown" else "Web Server"
-                notes = "Active (HTTP :80/443)"
+                service_notes.append("Web :80/443")
             elif is_private_mac(mac):
                 name = "Mobile Device (iOS / Android)"
-                notes = "Active (Private MAC Address)"
+                service_notes.append("Private MAC")
             else:
                 name = f"{vendor} Device" if vendor != "Unknown" else "Network Device"
-                notes = "Active"
+
+        if ip in ssdp_devices:
+            server = ssdp_devices[ip].get("server", "")
+            if server:
+                service_notes.append("UPnP: {}".format(server[:60]))
+            if ssdp_info.get("modelName"):
+                service_notes.append("Model: {}".format(ssdp_info["modelName"]))
+
+        # Format open ports badge if any
+        port_badges = []
+        for p in open_ports:
+            if p in PORT_SERVICE_MAP and p != 62078:
+                port_badges.append(str(p))
+        if port_badges:
+            service_notes.append(f"Ports: {','.join(port_badges[:3])}")
+
+        # Add OS / TTL note if available
+        if ttl is not None:
+            if ttl == 254 or ttl == 255:
+                service_notes.append(f"TTL: ~255 (Net)")
+            elif ttl <= 64:
+                service_notes.append(f"TTL: ~64 (UNIX/iOS)")
+            elif ttl <= 128:
+                service_notes.append(f"TTL: ~128 (Win)")
+
+        # Add interface
+        service_notes.append(f"[{data['iface']}]")
+
+        notes_str = " | ".join(service_notes) if service_notes else "Active"
 
         return {
             "ip": ip,
             "mac": mac,
             "vendor": vendor,
             "name": name,
-            "notes": notes,
+            "notes": notes_str,
+            "rtt": rtt,
+            "ttl": ttl,
+            "os_guess": os_guess,
             "is_local": is_local,
             "is_gateway": is_gw,
-            "open_ports": open_ports
+            "has_dup_mac": has_dup_mac,
+            "interface": data["iface"],
+            "arp_type": data["arp_type"],
+            "arp_expires_seconds": data.get("arp_expires_seconds"),
+            "open_ports": open_ports,
+            "ios_sync": has_ios_sync,
+            "netbios": nb_info,
+            "llmnr": llmnr_name,
+            "ssdp": ssdp_info
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         results = list(executor.map(enrich_device, arp_devices.keys()))
 
-    # Sort devices by IP address
     devices = sorted(results, key=lambda d: ipaddress.IPv4Address(d["ip"]))
     return devices, subnet_label
+
+def inspect_host(target_ip: str, progress=None) -> Dict:
+    """
+    Performs an in-depth forensic inspection of a single target IP.
+    Returns full port status, HTTP title, SSH banners, NetBIOS name, RTT jitter, and OS fingerprint.
+    """
+    gateway_ip = get_default_gateway()
+    # Determine ARP info (-n skips reverse DNS resolution to avoid delays/timeouts)
+    arp_res = subprocess.run(["arp", "-an"], capture_output=True, text=True, timeout=5)
+    mac, iface, arp_type, arp_expires_seconds = "Unknown", "Unknown", "Unknown", None
+    for line in arp_res.stdout.splitlines():
+        if f"({target_ip})" in line:
+            parts = line.split()
+            if "at" in parts:
+                idx = parts.index("at")
+                mac = parts[idx + 1].lower()
+                iface = parts[idx + 3] if len(parts) > idx + 3 else ""
+                if "permanent" in line:
+                    arp_type = "Static / Permanent"
+                else:
+                    arp_type = "Dynamic"
+                    expiry = re.search(r"expires? in (\d+) seconds?", line, re.IGNORECASE)
+                    if expiry:
+                        arp_expires_seconds = int(expiry.group(1))
+            break
+
+    vendor = lookup_vendor(mac) if mac != "Unknown" else "Unknown"
+
+    # Ping 3 times to compute min/avg/max/jitter
+    rtts = []
+    ttl = None
+    try:
+        ping_res = subprocess.run(["ping", "-c", "3", "-W", "300", target_ip], capture_output=True, text=True, timeout=2)
+        for line in ping_res.stdout.splitlines():
+            m_time = re.search(r"time=(\d+\.?\d*)\s*ms", line)
+            m_ttl = re.search(r"ttl=(\d+)", line)
+            if m_time:
+                rtts.append(float(m_time.group(1)))
+            if m_ttl and not ttl:
+                ttl = int(m_ttl.group(1))
+    except Exception:
+        pass
+
+    # Scan top 25 ports
+    ports_to_scan = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 548, 993, 3306, 3389, 5000, 5353, 5900, 8000, 8080, 8443, 62078]
+    open_ports = probe_ports_fast(target_ip, ports_to_scan, on_progress=progress)
+
+    # Measure connect latency if ping failed
+    if not rtts and open_ports:
+        for _ in range(3):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            t0 = time.time()
+            try:
+                if s.connect_ex((target_ip, open_ports[0])) == 0:
+                    rtts.append(round((time.time() - t0) * 1000.0, 2))
+            except Exception:
+                pass
+            finally:
+                s.close()
+
+    # Banners
+    web_results = [get_http_banner(target_ip, port) for port in (80, 443, 8080) if port in open_ports]
+    http_info = next((item for item in web_results if item.get("title") or item.get("server")), web_results[0] if web_results else {})
+    ssh_banner = get_ssh_banner(target_ip, 22) if 22 in open_ports else ""
+    netbios_info = query_netbios(target_ip)
+    llmnr_name = query_llmnr_ptr(target_ip) if not netbios_info else None
+    ios_sync = check_ios_lockdown(target_ip)
+
+    # OS Guessing
+    if ios_sync:
+        os_detected = "Apple iOS / iPadOS (Lockdown Wi-Fi Sync)"
+    elif ttl == 254 or ttl == 255:
+        os_detected = "Network Appliance (Router / Managed Switch)"
+    elif ttl and ttl <= 64:
+        os_detected = "Apple macOS / iOS / Linux / Android"
+    elif ttl and ttl <= 128:
+        os_detected = "Microsoft Windows"
+    elif 3389 in open_ports:
+        os_detected = "Microsoft Windows (RDP enabled)"
+    else:
+        os_detected = "Unknown / Generic OS"
+
+    return {
+        "ip": target_ip,
+        "mac": mac,
+        "vendor": vendor,
+        "iface": iface,
+        "arp_type": arp_type,
+        "arp_expires_seconds": arp_expires_seconds,
+        "is_gateway": (target_ip == gateway_ip),
+        "rtts": rtts,
+        "ttl": ttl,
+        "os_detected": os_detected,
+        "open_ports": open_ports,
+        "http_info": http_info,
+        "ssh_banner": ssh_banner,
+        "netbios_info": netbios_info,
+        "llmnr_name": llmnr_name,
+        "ios_sync": ios_sync
+    }
