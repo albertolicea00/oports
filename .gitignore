@@ -27,6 +27,7 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.workspace/*
 
 # Local cache
 .cache/
