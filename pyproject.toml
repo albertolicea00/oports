@@ -22,4 +22,10 @@ classifiers = [
 ]
 
 [project.scripts]
-oports = "cli.oports:main"
+oports = "cli.main:main"
+
+[project.optional-dependencies]
+tui = ["textual>=0.58"]
+
+[tool.setuptools.package-data]
+"cli.tui" = ["*.tcss"]
