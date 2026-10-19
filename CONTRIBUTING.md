@@ -7,7 +7,7 @@ Thank you for your interest in contributing to **OPorts**!
 1. **Fork the Repository**: Create your personal fork on GitHub.
 2. **Clone your fork**:
    ```bash
-   git clone https://github.com/<your-username>/OPorts.git
+   git clone https://github.com/albertolicea00/OPorts.git
    cd OPorts
    ```
 3. **Create a Feature Branch**:
